@@ -1,6 +1,5 @@
 #define _GNU_SOURCE
 #include <assert.h>
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>  // man 2 open
 #include <pthread.h>
@@ -321,23 +320,27 @@ static void *template_thread(void *unused) {
   // to ensure a stable recorded state is pointless: we're not going to read it
   // anyway! This is an only a potential optimization for later though.
 
+  // Counting via a live /proc/self/task scan is a TOCTOU race: DMTCP
+  // recreates checkpointed threads asynchronously via clone(), so a scan
+  // that runs before it has finished recreating all of them undercounts,
+  // and this barrier then releases before every thread has actually
+  // restarted (confirmed empirically: one thread's own restart-completion
+  // signal can arrive after this barrier already declared a "consistent
+  // state").
+  //
+  // head_record_mode instead gives an exact, race-free count: it only ever
+  // gets THREAD entries for genuine target threads (the template thread and
+  // the checkpoint thread never go through libmcmini's wrapped
+  // pthread_create(), so neither is ever recorded here), and -- since a
+  // DMTCP checkpoint is a full memory snapshot -- this list is preserved
+  // exactly as it was at record time across every restart, with no
+  // dependence on restart-time scheduling.
   int thread_count = 0;
-  struct dirent *entry;
-  DIR *dp = opendir("/proc/self/task");
-  if (dp == NULL) {
-    perror("opendir");
-    mc_exit(EXIT_FAILURE);
-  }
-
-  while ((entry = readdir(dp)))
-    if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0)
+  for (rec_list *entry = head_record_mode; entry != NULL; entry = entry->next) {
+    if (entry->vo.type == THREAD && entry->vo.thrd_state.status == ALIVE) {
       thread_count++;
-
-  // We don't want to count the template thread nor
-  // the checkpoint thread, but these will appear in
-  // `/proc/self/tasks`
-  thread_count -= 2;
-  closedir(dp);
+    }
+  }
   log_debug(
       "There are %d threads... waiting for them to get into a consistent "
       "state...\n",
